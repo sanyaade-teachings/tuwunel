@@ -2,6 +2,7 @@ mod and_then_ref;
 mod debug_inspect;
 mod filter;
 mod flat_ok;
+mod future_result;
 mod inspect_log;
 mod into_is_ok;
 mod is_err_or;
@@ -18,6 +19,7 @@ pub use self::{
 	debug_inspect::DebugInspect,
 	filter::Filter,
 	flat_ok::FlatOk,
+	future_result::ResultFutureResultExt,
 	inspect_log::{ErrDebugLog, ErrLog},
 	into_is_ok::IntoIsOk,
 	is_err_or::IsErrOr,

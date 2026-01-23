@@ -1,10 +1,6 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Not};
 
-use futures::{
-	FutureExt, StreamExt, TryFutureExt,
-	future::{join3, ready},
-	pin_mut,
-};
+use futures::{FutureExt, StreamExt, future::join3, pin_mut};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedServerName, RoomId, UserId,
 	api::federation,
@@ -15,12 +11,12 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Err, Result, debug_info, debug_warn, err, implement,
+	Err, Result, debug_info, err, implement,
 	matrix::{PduCount, room_version},
 	pdu::PduBuilder,
 	state_res,
 	utils::{
-		self, FutureBoolExt,
+		self, BoolExt, FutureBoolExt,
 		future::{ReadyBoolExt, TryExtExt},
 	},
 	warn,
@@ -39,28 +35,63 @@ pub async fn leave(
 	&self,
 	user_id: &UserId,
 	room_id: &RoomId,
-	reason: Option<String>,
+	reason: Option<&str>,
 	remote_leave_now: bool,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	let default_member_content = RoomMemberEventContent {
-		membership: MembershipState::Leave,
-		reason: reason.clone(),
-		join_authorized_via_users_server: None,
-		is_direct: None,
-		avatar_url: None,
-		displayname: None,
-		third_party_invite: None,
-		blurhash: None,
-	};
+	let is_joined = self
+		.services
+		.state_cache
+		.is_joined(user_id, room_id);
+
+	let is_invited = self
+		.services
+		.state_cache
+		.is_invited(user_id, room_id);
+
+	let is_knocked = self
+		.services
+		.state_cache
+		.is_knocked(user_id, room_id);
+
+	pin_mut!(is_joined, is_invited, is_knocked);
+
+	let can_leave = is_joined.or(is_invited).or(is_knocked).await;
+
+	if !can_leave {
+		return Err!(Request(NotFound("You are not in this room.")));
+	}
 
 	let is_banned = self.services.metadata.is_banned(room_id);
 	let is_disabled = self.services.metadata.is_disabled(room_id);
 
 	pin_mut!(is_banned, is_disabled);
-	if is_banned.or(is_disabled).await {
-		// the room is banned/disabled, the room must be rejected locally since we
-		// cant/dont want to federate with this server
+
+	let need_leave = !is_banned.or(is_disabled).await;
+
+	let need_clean = if need_leave {
+		self.do_leave(user_id, room_id, reason, remote_leave_now, state_lock)
+			.await
+			.inspect_err(|e| warn!(%user_id, %room_id, "Failed to leave room: {e}"))
+			.is_err()
+	} else {
+		warn!(%user_id, %room_id, "Resetting membership state for banned or disabled room");
+
+		true
+	};
+
+	if need_clean {
+		let default_member_content = RoomMemberEventContent {
+			membership: MembershipState::Leave,
+			reason: reason.map(ToOwned::to_owned),
+			join_authorized_via_users_server: None,
+			is_direct: None,
+			avatar_url: None,
+			displayname: None,
+			third_party_invite: None,
+			blurhash: None,
+		};
+
 		let count = self.services.globals.next_count();
 		self.services
 			.state_cache
@@ -75,10 +106,20 @@ pub async fn leave(
 				PduCount::Normal(*count),
 			)
 			.await?;
-
-		return Ok(());
 	}
 
+	Ok(())
+}
+
+#[implement(Service)]
+async fn do_leave(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	reason: Option<&str>,
+	remote_leave_now: bool,
+	state_lock: &RoomMutexGuard,
+) -> Result {
 	let member_event = self
 		.services
 		.state_accessor
@@ -93,8 +134,7 @@ pub async fn leave(
 		.services
 		.state_cache
 		.server_in_room(self.services.globals.server_name(), room_id)
-		.is_false()
-		.and(ready(member_event.as_ref().is_err()));
+		.is_false();
 
 	let not_knocked = self
 		.services
@@ -103,77 +143,21 @@ pub async fn leave(
 		.is_false();
 
 	// Ask a remote server if we don't have this room and are not knocking on it
-	if remote_leave_now || dont_have_room.and(not_knocked).await {
-		if let Err(e) = self
-			.remote_leave(user_id, room_id, reason)
+	if remote_leave_now
+		|| (member_event.as_ref().is_err() && dont_have_room.and(not_knocked).await)
+	{
+		self.remote_leave(user_id, room_id, reason)
 			.boxed()
 			.await
-		{
-			warn!(%user_id, "Failed to leave room {room_id} remotely: {e}");
-			// Don't tell the client about this error
-		}
-
-		let last_state = self
-			.services
-			.state_cache
-			.invite_state(user_id, room_id)
-			.or_else(|_| {
-				self.services
-					.state_cache
-					.knock_state(user_id, room_id)
-			})
-			.or_else(|_| {
-				self.services
-					.state_cache
-					.left_state(user_id, room_id)
-			})
-			.await
-			.ok();
-
-		// We always drop the invite, we can't rely on other servers
-		let count = self.services.globals.next_count();
-		self.services
-			.state_cache
-			.update_membership(
-				room_id,
-				user_id,
-				default_member_content,
-				user_id,
-				last_state,
-				None,
-				true,
-				PduCount::Normal(*count),
-			)
-			.await?;
 	} else {
-		let Ok(event) = member_event else {
-			debug_warn!(
-				"Trying to leave a room you are not a member of, marking room as left locally."
-			);
-
-			let count = self.services.globals.next_count();
-			return self
-				.services
-				.state_cache
-				.update_membership(
-					room_id,
-					user_id,
-					default_member_content,
-					user_id,
-					None,
-					None,
-					true,
-					PduCount::Normal(*count),
-				)
-				.await;
-		};
+		let event = member_event?;
 
 		self.services
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
 					membership: MembershipState::Leave,
-					reason,
+					reason: reason.map(ToOwned::to_owned),
 					join_authorized_via_users_server: None,
 					is_direct: None,
 					..event
@@ -183,19 +167,14 @@ pub async fn leave(
 				state_lock,
 			)
 			.await?;
-	}
 
-	Ok(())
+		Ok(())
+	}
 }
 
 #[implement(Service)]
 #[tracing::instrument(name = "remote", level = "debug", skip_all)]
-async fn remote_leave(
-	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
-	reason: Option<String>,
-) -> Result {
+async fn remote_leave(&self, user_id: &UserId, room_id: &RoomId, reason: Option<&str>) -> Result {
 	let mut make_leave_response_and_server =
 		Err!(BadServerResponse("No remote server available to assist in leaving {room_id}."));
 
@@ -320,7 +299,7 @@ async fn remote_leave(
 			displayname,
 			avatar_url,
 			blurhash,
-			reason,
+			reason: reason.map(ToOwned::to_owned),
 			..RoomMemberEventContent::new(MembershipState::Leave)
 		})?,
 	);
