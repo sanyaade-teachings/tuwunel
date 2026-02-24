@@ -1,4 +1,3 @@
-pub mod blurhash;
 mod data;
 pub(super) mod migrations;
 mod preview;

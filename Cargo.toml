@@ -95,14 +95,6 @@ default-features = false
 version = "0.22"
 default-features = false
 
-[workspace.dependencies.blurhash]
-version = "0.2"
-default-features = false
-features = [
-	"fast-linear-to-srgb",
-	"image",
-]
-
 [workspace.dependencies.bytes]
 version = "1.11"
 

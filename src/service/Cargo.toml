@@ -18,10 +18,6 @@ crate-type = [
 ]
 
 [features]
-blurhashing = [
-	"dep:image",
-	"dep:blurhash",
-]
 brotli_compression = [
 	"tuwunel-core/brotli_compression",
 	"reqwest/brotli",
@@ -121,8 +117,6 @@ url.workspace = true
 webpage.workspace = true
 webpage.optional = true
 webpki-root-certs.workspace = true
-blurhash.workspace = true
-blurhash.optional = true
 tuwunel-core.workspace = true
 tuwunel-database.workspace = true
 

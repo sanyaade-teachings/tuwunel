@@ -66,17 +66,9 @@ pub(crate) async fn create_content_route(
 		.create(mxc, Some(user), Some(&content_disposition), content_type, &body.file)
 		.await?;
 
-	let blurhash = body.generate_blurhash.then(|| {
-		services
-			.media
-			.create_blurhash(&body.file, content_type, filename)
-			.ok()
-			.flatten()
-	});
-
 	Ok(create_content::v3::Response {
 		content_uri: mxc.to_string().into(),
-		blurhash: blurhash.flatten(),
+		blurhash: None,
 	})
 }
 

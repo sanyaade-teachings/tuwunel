@@ -67,9 +67,6 @@ default = [
 	"zstd_compression",
 ]
 
-blurhashing = [
-	"tuwunel-service/blurhashing",
-]
 brotli_compression = [
 	"tuwunel-admin/brotli_compression",
 	"tuwunel-api/brotli_compression",
