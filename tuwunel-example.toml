@@ -1953,6 +1953,10 @@
 #
 #sso_aware_preferred = false
 
+# Directory containing appservice yaml registration files.
+#
+#appservice_dir = ""
+
 
 
 #[global.tls]
