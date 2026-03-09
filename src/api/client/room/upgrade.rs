@@ -26,7 +26,7 @@ use tuwunel_core::{
 	matrix::{Event, StateKey, pdu::PduBuilder, room_version},
 	utils::{
 		future::TryExtExt,
-		stream::{IterStream, ReadyExt, WidebandExt},
+		stream::{IterStream, WidebandExt},
 	},
 };
 use tuwunel_service::{Services, rooms::timeline::RoomMutexGuard};
@@ -50,6 +50,7 @@ const RECOMMENDED_TRANSFERABLE_STATE_EVENT_TYPES: &[StateEventType; 9] = &[
 struct RoomUpgradeContext<'a> {
 	services: &'a Services,
 	sender_user: &'a UserId,
+	creator: &'a UserId,
 	old_room_id: &'a RoomId,
 	old_state_lock: &'a RoomMutexGuard,
 	new_room_id: &'a RoomId,
@@ -119,12 +120,17 @@ pub(crate) async fn upgrade_room_route(
 		"Attempting upgrade of room..."
 	);
 
-	let id_format = version_rules.room_id_format;
-	let (replacement_room, state_lock) = match id_format {
+	let creator = if services.admin.is_admin_room(&body.room_id).await {
+		&services.globals.server_user
+	} else {
+		sender_user
+	};
+
+	let (replacement_room, state_lock) = match version_rules.room_id_format {
 		| RoomIdFormatVersion::V2 =>
 			upgrade_room_create(
 				&services,
-				sender_user,
+				creator,
 				old_room_id,
 				new_version,
 				&version_rules,
@@ -136,7 +142,7 @@ pub(crate) async fn upgrade_room_route(
 		| RoomIdFormatVersion::V1 =>
 			upgrade_room_create_legacy(
 				&services,
-				sender_user,
+				creator,
 				old_room_id,
 				new_version,
 				&version_rules,
@@ -149,6 +155,7 @@ pub(crate) async fn upgrade_room_route(
 	let context = RoomUpgradeContext {
 		services: &services,
 		sender_user,
+		creator,
 		old_room_id: &body.room_id,
 		old_state_lock: &old_state_lock,
 		new_room_id: &replacement_room,
@@ -312,9 +319,11 @@ async fn upgrade_room_create_legacy(
 #[implement(RoomUpgradeContext, params = "<'_>")]
 #[tracing::instrument(level = "debug")]
 async fn transfer_room(&self) -> Result {
-	self.move_joined_member().await?;
+	self.move_creator().await?;
 
 	self.move_state_events().await?;
+
+	self.move_sender_user().await?;
 
 	self.move_local_aliases().await?;
 
@@ -332,30 +341,59 @@ async fn transfer_room(&self) -> Result {
 // Join the new room
 #[implement(RoomUpgradeContext, params = "<'_>")]
 #[tracing::instrument(level = "debug")]
-async fn move_joined_member(&self) -> Result<OwnedEventId> {
+async fn move_creator(&self) -> Result {
+	self.move_member(self.creator).await?;
+
+	Ok(())
+}
+
+#[implement(RoomUpgradeContext, params = "<'_>")]
+#[tracing::instrument(level = "debug")]
+async fn move_sender_user(&self) -> Result {
+	if self.sender_user != self.creator {
+		self.services
+			.timeline
+			.build_and_append_pdu(
+				PduBuilder::state(
+					self.sender_user.as_str(),
+					&RoomMemberEventContent::new(MembershipState::Invite),
+				),
+				self.creator,
+				self.new_room_id,
+				self.new_state_lock,
+			)
+			.await?;
+
+		self.move_member(self.sender_user).await?;
+	}
+
+	Ok(())
+}
+
+#[implement(RoomUpgradeContext, params = "<'_>")]
+#[tracing::instrument(level = "debug")]
+async fn move_member(&self, user_id: &UserId) -> Result {
 	let old_content: RoomMemberEventContent = self
 		.services
 		.state_accessor
-		.room_state_get_content(
-			self.old_room_id,
-			&StateEventType::RoomMember,
-			self.sender_user.as_str(),
-		)
+		.room_state_get_content(self.old_room_id, &StateEventType::RoomMember, user_id.as_str())
 		.inspect_err(|e| error!(?self, "Missing room member event: {e}"))
 		.await?;
 
 	self.services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(self.sender_user.as_str(), &RoomMemberEventContent {
+			PduBuilder::state(user_id.as_str(), &RoomMemberEventContent {
 				membership: MembershipState::Join,
 				..old_content
 			}),
-			self.sender_user,
+			user_id,
 			self.new_room_id,
 			self.new_state_lock,
 		)
-		.await
+		.await?;
+
+	Ok(())
 }
 
 // Replicate transferable state events to the new room
@@ -378,7 +416,7 @@ async fn move_state_events(&self) -> Result {
 				.timeline
 				.build_and_append_pdu(
 					self.rebuild_state_event(&event)?,
-					self.sender_user,
+					self.creator,
 					self.new_room_id,
 					self.new_state_lock,
 				)
@@ -414,7 +452,7 @@ fn rebuild_state_event<Pdu: Event>(&self, event: &Pdu) -> Result<PduBuilder> {
 						.map(AsRef::as_ref)
 						.map(UserId::as_str)
 						.any(is_equal_to!(user_id.as_str()))
-						&& self.sender_user.as_str() != user_id.as_str()
+						&& self.creator.as_str() != user_id.as_str()
 				});
 			}
 
@@ -445,18 +483,10 @@ async fn move_local_aliases(&self) -> Result {
 	self.services
 		.alias
 		.local_aliases_for_room(self.old_room_id)
-		.filter_map(|alias| {
+		.for_each(async |alias| {
 			self.services
 				.alias
-				.remove_alias_by(alias, self.sender_user)
-				.inspect_err(move |e| error!(?alias, ?self, "Failed to remove alias: {e}"))
-				.map_ok(move |()| alias)
-				.ok()
-		})
-		.ready_for_each(|alias| {
-			self.services
-				.alias
-				.set_alias_by(alias, self.new_room_id, self.sender_user)
+				.set_alias_by(alias, self.new_room_id, self.creator)
 				.inspect_err(|e| error!(?self, "Failed to add alias: {e}"))
 				.ok();
 		})
