@@ -433,34 +433,42 @@ async fn move_state_events(&self) -> Result {
 #[tracing::instrument(level = "debug")]
 fn rebuild_state_event<Pdu: Event>(&self, event: &Pdu) -> Result<PduBuilder> {
 	let content = match event.kind() {
-		| TimelineEventType::RoomPowerLevels
+		| TimelineEventType::RoomPowerLevels => {
+			let mut content = event.get_content_as_value();
+
 			if self
 				.new_version_rules
 				.authorization
-				.explicitly_privilege_room_creators =>
-		{
-			let mut content = event.get_content_as_value();
+				.explicitly_privilege_room_creators
+			{
+				if let Some(users) = content
+					.get_mut("users")
+					.and_then(JsonValue::as_object_mut)
+				{
+					users.retain(|user_id, _pl| {
+						!self
+							.additional_creators
+							.iter()
+							.map(AsRef::as_ref)
+							.map(UserId::as_str)
+							.any(is_equal_to!(user_id.as_str()))
+							&& self.creator.as_str() != user_id.as_str()
+					});
+				}
 
-			if let Some(users) = content
+				if content["events"]["m.room.tombstone"]
+					.as_i64()
+					.is_none_or(is_less_than!(150))
+				{
+					content["events"]["m.room.tombstone"] = to_value(150)?;
+				}
+			} else if let Some(users) = content
 				.get_mut("users")
 				.and_then(JsonValue::as_object_mut)
 			{
-				users.retain(|user_id, _pl| {
-					!self
-						.additional_creators
-						.iter()
-						.map(AsRef::as_ref)
-						.map(UserId::as_str)
-						.any(is_equal_to!(user_id.as_str()))
-						&& self.creator.as_str() != user_id.as_str()
-				});
-			}
-
-			if content["events"]["m.room.tombstone"]
-				.as_i64()
-				.is_none_or(is_less_than!(150))
-			{
-				content["events"]["m.room.tombstone"] = to_value(150)?;
+				users
+					.entry(self.creator.as_str())
+					.or_insert(to_value(100)?);
 			}
 
 			to_raw_value(&content)?
